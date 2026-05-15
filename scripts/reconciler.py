@@ -16,9 +16,11 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
+MONTH_END_SUMMARY_PATH = PROJECT_ROOT / "Month_End_Summary.txt"
 
 COMPARE_FIELDS = ("post_date", "account_code", "description", "debit", "credit", "currency")
 AI_CATEGORIES = ("Timing difference", "Currency Error", "missing entry")
+RISK_LEVELS = ("High", "Medium", "Low")
 
 
 def load_ledger(path: Path) -> pd.DataFrame:
@@ -37,6 +39,42 @@ def _normalize_amount(val: str) -> float | None:
         return float(val)
     except ValueError:
         return None
+
+
+def _row_amount(row: dict | None) -> float:
+    """Largest non-zero debit/credit on a ledger row."""
+    if not row:
+        return 0.0
+    debit = _normalize_amount(str(row.get("debit", ""))) or 0.0
+    credit = _normalize_amount(str(row.get("credit", ""))) or 0.0
+    return max(debit, credit)
+
+
+def compute_discrepancy_variance(d: dict) -> float:
+    """Monetary variance attributable to a single discrepancy (USD)."""
+    issue = d.get("issue", "")
+    diffs = d.get("diffs") or []
+
+    if issue in ("missing_in_sub", "extra_in_sub", "duplicate_in_sub"):
+        return _row_amount(d.get("hq") or d.get("sub"))
+
+    amount_fields = {"debit", "credit"}
+    variance = 0.0
+    for diff in diffs:
+        if diff.get("field") not in amount_fields:
+            continue
+        hq_amt = _normalize_amount(diff.get("hq", ""))
+        sub_amt = _normalize_amount(diff.get("sub", ""))
+        if hq_amt is not None and sub_amt is not None:
+            variance += abs(hq_amt - sub_amt)
+
+    if variance > 0:
+        return variance
+
+    if any(x.get("field") == "post_date" for x in diffs):
+        return 0.0
+
+    return _row_amount(d.get("hq") or d.get("sub"))
 
 
 def find_mismatches(hq: pd.DataFrame, sub: pd.DataFrame) -> list[dict]:
@@ -272,12 +310,219 @@ def _rule_based_classify(d: dict) -> tuple[str, str]:
     )
 
 
-def reconcile(hq_path: Path, sub_path: Path) -> dict:
+def _exposure_usd(d: dict, variance_usd: float) -> float:
+    """Materiality basis for risk: variance amount or full line exposure."""
+    if variance_usd > 0:
+        return variance_usd
+    return _row_amount(d.get("hq") or d.get("sub"))
+
+
+def _risk_from_exposure(exposure_usd: float) -> str:
+    if exposure_usd >= 5000:
+        return "High"
+    if exposure_usd >= 500:
+        return "Medium"
+    return "Low"
+
+
+def _rule_based_risk_action(d: dict, variance_usd: float) -> tuple[str, str]:
+    """Fallback risk rating and finance-team action when LLM is unavailable."""
+    category = d.get("ai_category", "")
+    issue = d.get("issue", "")
+    desc = d.get("description", "")
+    exposure = _exposure_usd(d, variance_usd)
+    risk = _risk_from_exposure(exposure)
+
+    if issue in ("missing_in_sub", "extra_in_sub", "duplicate_in_sub"):
+        if issue == "missing_in_sub":
+            action = (
+                f"Request subsidiary posting support for '{desc}' and re-post the "
+                f"${variance_usd:,.2f} entry before close."
+            )
+        else:
+            action = (
+                f"Investigate duplicate or phantom entry for '{desc}' and reverse "
+                f"if not supported by source documents."
+            )
+        return risk, action
+
+    if category == "Timing difference":
+        return (
+            risk,
+            f"Confirm cut-off: reclassify '{desc}' (${exposure:,.2f} exposure) to the "
+            f"correct period or document as an intercompany timing item for month-end.",
+        )
+
+    if category == "Currency Error":
+        return (
+            risk,
+            f"Reconcile amount for '{desc}': verify exchange rates, rounding, and "
+            f"correct the ${variance_usd:,.2f} variance between HQ and subsidiary.",
+        )
+
+    return (
+        risk,
+        f"Review supporting documentation for '{desc}' and clear the "
+        f"${variance_usd:,.2f} open variance.",
+    )
+
+
+def analyze_discrepancies_with_agent(
+    discrepancies: list[dict], model: str = "gpt-4o-mini"
+) -> list[dict]:
+    """
+    AI agent pass: risk rating (High/Medium/Low) and suggested finance action per item.
+    """
+    enriched: list[dict] = []
+    for d in discrepancies:
+        variance = compute_discrepancy_variance(d)
+        risk, action = _rule_based_risk_action(d, variance)
+        enriched.append(
+            {
+                **d,
+                "variance_usd": variance,
+                "risk_rating": risk,
+                "suggested_action": action,
+                "analysis_source": "rule_based_agent",
+            }
+        )
+
+    if not enriched:
+        return enriched
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return enriched
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        payload = []
+        for d in enriched:
+            payload.append(
+                {
+                    "txn_id": d["txn_id"],
+                    "description": d.get("description", ""),
+                    "issue": d.get("issue", ""),
+                    "ai_category": d.get("ai_category", ""),
+                    "ai_reason": d.get("ai_reason", ""),
+                    "variance_usd": d["variance_usd"],
+                    "field_diffs": d.get("diffs", []),
+                }
+            )
+
+        system_prompt = (
+            "You are a month-end finance reconciliation AI agent. "
+            "For each discrepancy, assign:\n"
+            "- risk_rating: exactly one of High, Medium, Low (materiality + control risk)\n"
+            "- suggested_action: one concrete sentence for the finance team "
+            "(e.g. contact bank, verify FX rate, request missing sub-ledger posting)\n\n"
+            "Respond with JSON only: "
+            '{"items": [{"txn_id": "...", "risk_rating": "High|Medium|Low", '
+            '"suggested_action": "..."}]}'
+        )
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, indent=2)},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        parsed = json.loads(response.choices[0].message.content or "{}")
+        by_id = {item["txn_id"]: item for item in parsed.get("items", []) if item.get("txn_id")}
+
+        for d in enriched:
+            ai_item = by_id.get(d["txn_id"])
+            if not ai_item:
+                continue
+            risk = ai_item.get("risk_rating", "")
+            if risk in RISK_LEVELS:
+                d["risk_rating"] = risk
+            action = (ai_item.get("suggested_action") or "").strip()
+            if action:
+                d["suggested_action"] = action
+            d["analysis_source"] = "openai"
+    except Exception as exc:
+        print(f"Warning: AI month-end analysis failed ({exc}). Using rule-based fallback.\n")
+
+    return enriched
+
+
+def write_month_end_summary(
+    discrepancies: list[dict],
+    output_path: Path = MONTH_END_SUMMARY_PATH,
+    hq_rows: int = 0,
+    sub_rows: int = 0,
+) -> Path:
+    """Write Month_End_Summary.txt for the finance team."""
+    total_variance = sum(d.get("variance_usd", 0.0) for d in discrepancies)
+    lines = [
+        "MONTH-END RECONCILIATION SUMMARY",
+        "Generated by Self-Healing Reconciler (AI Agent Analysis)",
+        "=" * 70,
+        "",
+        f"HQ ledger rows: {hq_rows}",
+        f"Subsidiary ledger rows: {sub_rows}",
+        f"Discrepancies analyzed: {len(discrepancies)}",
+        "",
+        "TOTAL VARIANCE VALUE",
+        "-" * 70,
+        f"  ${total_variance:,.2f} USD  (sum of monetary exposure across all items)",
+        "",
+    ]
+
+    if not discrepancies:
+        lines.append("No discrepancies found. Ledgers are reconciled for month-end close.")
+    else:
+        lines.extend(["DISCREPANCY DETAIL", "-" * 70, ""])
+        for d in discrepancies:
+            variance = d.get("variance_usd", 0.0)
+            lines.extend(
+                [
+                    f"Transaction: {d['txn_id']}",
+                    f"  Description:     {d.get('description', '')}",
+                    f"  AI category:     {d.get('ai_category', 'n/a')}",
+                    f"  Variance (USD):  ${variance:,.2f}",
+                    f"  Risk rating:     {d.get('risk_rating', 'n/a')}",
+                    f"  Suggested action: {d.get('suggested_action', 'n/a')}",
+                    f"  (Analysis via {d.get('analysis_source', 'n/a')})",
+                    "",
+                ]
+            )
+
+        by_risk = {r: sum(1 for d in discrepancies if d.get("risk_rating") == r) for r in RISK_LEVELS}
+        lines.extend(
+            [
+                "RISK SUMMARY",
+                "-" * 70,
+                f"  High:   {by_risk.get('High', 0)}",
+                f"  Medium: {by_risk.get('Medium', 0)}",
+                f"  Low:    {by_risk.get('Low', 0)}",
+                "",
+                "RECOMMENDED NEXT STEPS",
+                "-" * 70,
+                "  1. Clear all High-risk items before filing.",
+                "  2. Obtain subsidiary support for missing or timing items.",
+                "  3. Post correcting journals for confirmed amount variances.",
+                "",
+            ]
+        )
+
+    lines.append("=" * 70)
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    return output_path
+
+
+def reconcile(hq_path: Path, sub_path: Path, model: str = "gpt-4o-mini") -> dict:
     hq = load_ledger(hq_path)
     sub = load_ledger(sub_path)
     discrepancies = find_mismatches(hq, sub)
-    classified = classify_with_ai_agent(discrepancies)
-    return {"discrepancies": classified, "hq_rows": len(hq), "sub_rows": len(sub)}
+    classified = classify_with_ai_agent(discrepancies, model=model)
+    analyzed = analyze_discrepancies_with_agent(classified, model=model)
+    return {"discrepancies": analyzed, "hq_rows": len(hq), "sub_rows": len(sub)}
 
 
 def print_report(result: dict) -> None:
@@ -327,13 +572,37 @@ def main() -> None:
         default=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
         help="OpenAI model when OPENAI_API_KEY is set",
     )
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        default=MONTH_END_SUMMARY_PATH,
+        help="Path for Month_End_Summary.txt (default: project root)",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Skip writing Month_End_Summary.txt",
+    )
     args = parser.parse_args()
 
     hq = load_ledger(args.hq)
     sub = load_ledger(args.sub)
     discrepancies = find_mismatches(hq, sub)
     classified = classify_with_ai_agent(discrepancies, model=args.model)
-    print_report({"discrepancies": classified, "hq_rows": len(hq), "sub_rows": len(sub)})
+    analyzed = analyze_discrepancies_with_agent(classified, model=args.model)
+    result = {"discrepancies": analyzed, "hq_rows": len(hq), "sub_rows": len(sub)}
+    print_report(result)
+
+    if not args.no_summary:
+        summary_path = write_month_end_summary(
+            analyzed,
+            output_path=args.summary,
+            hq_rows=len(hq),
+            sub_rows=len(sub),
+        )
+        total = sum(d.get("variance_usd", 0.0) for d in analyzed)
+        print(f"Month-end summary written: {summary_path}")
+        print(f"Total variance value: ${total:,.2f} USD\n")
 
 
 if __name__ == "__main__":

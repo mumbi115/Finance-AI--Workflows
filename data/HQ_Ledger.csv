@@ -8,6 +8,6 @@ TXN-1006,2026-05-03,6100-PAYROLL,Salary expense accrual,12000.00,,USD
 TXN-1007,2026-05-04,1200-AR,Client invoice billed,4500.00,,USD
 TXN-1008,2026-05-04,2200-ACCRUED,Accrued liability reversal,,650.00,USD
 TXN-1009,2026-05-05,6300-UTILITIES,Utility bill payment,99.99,,USD
-TXN-1010,2026-05-05,1000-CASH,Petty cash replenishment,200.00,,USD
+TXN-1010,2026-05-05,1000-CASH,Petty cash replenishment,1000.00,,USD
 TXN-1011,2026-05-06,4000-REVENUE,Consulting fee earned,,1800.00,USD
 TXN-1012,2026-05-06,2100-AP,Supplier credit memo,,800.00,USD

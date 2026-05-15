@@ -1,8 +1,10 @@
 """
 Project 1: The Self-Healing Reconciler
 
-Uses Pandas to detect HQ vs Sub ledger mismatches, then an AI agent
-classifies each discrepancy as Timing difference, Currency Error, or missing entry.
+Compares data/HQ_Ledger.csv (headquarters) vs data/Sub_Ledger.csv (subsidiary)
+using Pandas, then classifies each discrepancy with an AI agent.
+
+Run: python scripts/reconciler.py
 """
 
 from __future__ import annotations
@@ -75,6 +77,18 @@ def compute_discrepancy_variance(d: dict) -> float:
         return 0.0
 
     return _row_amount(d.get("hq") or d.get("sub"))
+
+
+def compare_ledgers(hq_path: Path, sub_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, list[dict]]:
+    """
+    Load HQ and Sub CSVs and return all discrepancies between them.
+
+    Returns:
+        hq_df, sub_df, list of mismatch records (txn_id, issue, diffs, etc.)
+    """
+    hq = load_ledger(hq_path)
+    sub = load_ledger(sub_path)
+    return hq, sub, find_mismatches(hq, sub)
 
 
 def find_mismatches(hq: pd.DataFrame, sub: pd.DataFrame) -> list[dict]:
@@ -585,9 +599,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    hq = load_ledger(args.hq)
-    sub = load_ledger(args.sub)
-    discrepancies = find_mismatches(hq, sub)
+    hq, sub, discrepancies = compare_ledgers(args.hq, args.sub)
     classified = classify_with_ai_agent(discrepancies, model=args.model)
     analyzed = analyze_discrepancies_with_agent(classified, model=args.model)
     result = {"discrepancies": analyzed, "hq_rows": len(hq), "sub_rows": len(sub)}
